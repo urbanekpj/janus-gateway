@@ -1436,6 +1436,7 @@ static GThread *handler_thread;
 static void *janus_videoroom_handler(void *data);
 static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data);
 static void janus_videoroom_relay_data_packet(gpointer data, gpointer user_data);
+static void janus_videoroom_relay_data_packet_to_publisher(gpointer data, gpointer user_data);
 static void janus_videoroom_hangup_media_internal(gpointer session_data);
 
 typedef enum janus_videoroom_p_type {
@@ -5445,8 +5446,33 @@ void janus_videoroom_incoming_data(janus_plugin_session *handle, janus_plugin_da
 	if(packet->buffer == NULL || packet->length == 0)
 		return;
 	janus_videoroom_session *session = (janus_videoroom_session *)handle->plugin_handle;
-	if(!session || g_atomic_int_get(&session->destroyed) || session->participant_type != janus_videoroom_p_type_publisher)
-		return;
+	if(!session || g_atomic_int_get(&session->destroyed) || session->participant_type != janus_videoroom_p_type_publisher) {
+	    if(session->participant_type == janus_videoroom_p_type_subscriber) {
+            JANUS_LOG(LOG_VERB, "Forwarding data packet to publisher");
+            janus_mutex_lock(&session->mutex);
+            janus_videoroom_subscriber *subscriber = (janus_videoroom_subscriber *)session->participant;
+            if(subscriber) {
+                janus_refcount_increase_nodebug(&subscriber->ref);
+                if(subscriber->feed) {
+                    janus_videoroom_publisher *p = subscriber->feed;
+
+                    char *buf = packet->buffer;
+                    uint16_t len = packet->length;
+
+                    janus_videoroom_rtp_relay_packet pkt;
+                    pkt.data = (struct rtp_header *)buf;
+                    pkt.length = len;
+                    pkt.is_rtp = FALSE;
+                    pkt.textdata = !packet->binary;
+                    janus_videoroom_relay_data_packet_to_publisher(p,&pkt);
+                }
+
+                janus_refcount_decrease_nodebug(&subscriber->ref);
+            }
+            janus_mutex_unlock(&session->mutex);
+        }
+        return;
+    }
 	janus_videoroom_publisher *participant = janus_videoroom_session_get_publisher_nodebug(session);
 	if(participant == NULL)
 		return;
@@ -7995,6 +8021,38 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 	}
 
 	return;
+}
+
+static void janus_videoroom_relay_data_packet_to_publisher(gpointer data, gpointer user_data) {
+    janus_videoroom_rtp_relay_packet *packet = (janus_videoroom_rtp_relay_packet *)user_data;
+    if(!packet || packet->is_rtp || !packet->data || packet->length < 1) {
+        JANUS_LOG(LOG_ERR, "Invalid packet...\n");
+        return;
+    }
+    janus_videoroom_publisher *publisher = (struct janus_videoroom_publisher *)data;
+    if(!publisher || !publisher->session || !publisher->data) {
+        return;
+    }
+    janus_videoroom_session *session = publisher->session;
+    if(!session || !session->handle) {
+        return;
+    }
+    if(!g_atomic_int_get(&session->started) || !g_atomic_int_get(&session->dataready)) {
+        return;
+    }
+    if(gateway != NULL && packet->data != NULL) {
+        JANUS_LOG(LOG_VERB, "Forwarding %s DataChannel message (%d bytes) to publisher\n",
+                  packet->textdata ? "text" : "binary", packet->length);
+        janus_plugin_data data = {
+                .label = NULL,
+                .protocol = NULL,
+                .binary = !packet->textdata,
+                .buffer = (char *)packet->data,
+                .length = packet->length
+        };
+        gateway->relay_data(session->handle, &data);
+    }
+    return;
 }
 
 static void janus_videoroom_relay_data_packet(gpointer data, gpointer user_data) {
